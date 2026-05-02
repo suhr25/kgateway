@@ -34,6 +34,7 @@ var _ manager.LeaderElectionRunnable = (*gatewayClassReconciler)(nil)
 var emptyGatewayClass = types.NamespacedName{}
 
 type gatewayClassReconciler struct {
+	ctx                   context.Context
 	classInfo             map[string]*deployer.GatewayClassInfo
 	defaultControllerName string
 	gwClassClient         kclient.Client[*gwv1.GatewayClass]
@@ -94,6 +95,7 @@ func (r *gatewayClassReconciler) NeedLeaderElection() bool {
 
 // Start starts the GatewayClass reconciler and blocks until the stop channel is closed.
 func (r *gatewayClassReconciler) Start(ctx context.Context) error {
+	r.ctx = ctx
 	// Seed the queue with an initial event to ensure default GatewayClass creation
 	r.queue.Add(emptyGatewayClass)
 
@@ -114,11 +116,11 @@ func (r *gatewayClassReconciler) reconcile(req types.NamespacedName) (rErr error
 
 	if req == emptyGatewayClass {
 		// This is the initial reconciliation event to ensure the default GatewayClasses are created/updated
-		return r.reconcileGatewayClasses()
+		return r.reconcileGatewayClasses(r.ctx)
 	}
 	// Reconcile spec if this GatewayClass is managed by us
 	if info, ok := r.classInfo[req.Name]; ok {
-		if err := r.reconcileGatewayClass(req.Name, info); err != nil {
+		if err := r.reconcileGatewayClass(r.ctx, req.Name, info); err != nil {
 			return fmt.Errorf("error reconciling GatewayClass spec: %w", err)
 		}
 	}
@@ -153,7 +155,7 @@ func (r *gatewayClassReconciler) reconcile(req types.NamespacedName) (rErr error
 	return nil
 }
 
-func (r *gatewayClassReconciler) reconcileGatewayClasses() error {
+func (r *gatewayClassReconciler) reconcileGatewayClasses(ctx context.Context) error {
 	var errs []error
 	for name, info := range r.classInfo {
 		// Validate the GatewayClass name using Kubernetes object name validation
@@ -161,20 +163,20 @@ func (r *gatewayClassReconciler) reconcileGatewayClasses() error {
 			errs = append(errs, fmt.Errorf("invalid GatewayClass name %q: %v", name, validationErrs))
 			continue
 		}
-		if err := r.reconcileGatewayClass(name, info); err != nil {
+		if err := r.reconcileGatewayClass(ctx, name, info); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
 }
 
-func (r *gatewayClassReconciler) reconcileGatewayClass(name string, info *deployer.GatewayClassInfo) error {
+func (r *gatewayClassReconciler) reconcileGatewayClass(ctx context.Context, name string, info *deployer.GatewayClassInfo) error {
 	// Build desired GatewayClass with only fields we want to manage via SSA
 	desired := r.buildDesiredGatewayClass(name, info)
 
 	// Always apply using SSA - SSA is idempotent and will only update if needed
 	logger.Debug("applying GatewayClass via SSA", "name", name)
-	if err := r.applyGatewayClass(desired, r.getControllerName(name)); err != nil {
+	if err := r.applyGatewayClass(ctx, desired, r.getControllerName(name)); err != nil {
 		return fmt.Errorf("error applying GatewayClass %s: %w", name, err)
 	}
 	return nil
@@ -202,7 +204,7 @@ func (r *gatewayClassReconciler) buildDesiredGatewayClass(name string, info *dep
 	return gwc
 }
 
-func (r *gatewayClassReconciler) applyGatewayClass(gwc *gwv1.GatewayClass, controllerName string) error {
+func (r *gatewayClassReconciler) applyGatewayClass(ctx context.Context, gwc *gwv1.GatewayClass, controllerName string) error {
 	gvr := gvr.GatewayClass
 	c := r.client.Dynamic().Resource(gvr).Namespace(metav1.NamespaceNone)
 
@@ -217,7 +219,7 @@ func (r *gatewayClassReconciler) applyGatewayClass(gwc *gwv1.GatewayClass, contr
 		return fmt.Errorf("error marshaling GatewayClass: %w", err)
 	}
 
-	_, err = c.Patch(context.Background(), gwc.Name, types.ApplyPatchType, js, metav1.PatchOptions{
+	_, err = c.Patch(ctx, gwc.Name, types.ApplyPatchType, js, metav1.PatchOptions{
 		Force:        new(true),
 		FieldManager: controllerName,
 	})
